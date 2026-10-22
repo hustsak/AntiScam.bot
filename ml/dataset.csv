@@ -1,0 +1,6 @@
+file_size,filename_length,extension_length,is_executable,has_double_extension,contains_payment_keyword,contains_urgent_keyword,entropy,ascii_ratio,sha256_length,label,filename
+31,9,4,0,0,0,0,4.063562746695364,0.9354838709677419,64,0,hello.txt
+20,9,4,0,0,0,0,3.4841837197791885,0.9,64,0,photo.jpg
+31,12,4,0,0,0,0,3.5421176810056703,0.9354838709677419,64,1,document.txt
+31,15,4,1,1,1,0,3.5421176810056703,0.9354838709677419,64,1,invoice.pdf.exe
+31,10,4,1,0,0,1,3.5421176810056703,0.9354838709677419,64,1,update.ps1

@@ -1,0 +1,561 @@
+﻿from api.case_store import create_case
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import json
+import tempfile
+from pathlib import Path
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
+
+from intelligence.ip_lookup import lookup_ip
+from intelligence.extract import extract_indicators
+
+from analyzer.archive_content import analyze_zip_content
+from analyzer.clamav_scan import scan_with_clamav
+from analyzer.yara_scan import scan_with_yara
+from analyzer.hash import calculate_sha256
+from analyzer.file_info import get_file_info
+from analyzer.indicators import analyze_filename
+from analyzer.risk import calculate_risk
+from analyzer.archive import analyze_zip
+
+
+# ============================================================
+# FASTAPI APPLICATION
+# ============================================================
+
+app = FastAPI(
+    title="KhmerShield AI",
+    description="Telegram Scam & Suspicious File Detector",
+    version="0.1.0"
+)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+ALLOWED_EXTENSIONS = {
+    ".zip",
+    ".rar",
+    ".7z",
+    ".pdf",
+    ".exe",
+    ".apk",
+    ".txt",
+}
+
+MAX_FILE_SIZE = 50 * 1024 * 1024
+
+
+# ============================================================
+# PROJECT PATHS
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+REPORTS_DIR = PROJECT_ROOT / "reports"
+
+CASES_FILE = REPORTS_DIR / "telegram_cases.jsonl"
+
+
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get("/")
+def root():
+    return {
+        "project": "KhmerShield AI",
+        "status": "online",
+        "version": "0.1.0"
+    }
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "analyzer": "ready"
+    }
+
+
+# ============================================================
+# CASE STORAGE
+# ============================================================
+
+def load_cases():
+    """
+    Load all saved KhmerShield security cases
+    from reports/telegram_cases.jsonl.
+    """
+
+    if not CASES_FILE.exists():
+        return []
+
+    cases = []
+
+    try:
+        with open(CASES_FILE, "r", encoding="utf-8") as f:
+
+            for line in f:
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                try:
+                    case = json.loads(line)
+                    cases.append(case)
+
+                except json.JSONDecodeError:
+                    # Ignore malformed lines
+                    continue
+
+    except OSError:
+        return []
+
+    return cases
+
+
+# ============================================================
+# CASE STATISTICS
+# IMPORTANT:
+# This endpoint MUST appear before /api/cases/{case_id}
+# ============================================================
+
+@app.get("/api/cases/stats")
+def get_case_stats():
+    """
+    Return dashboard statistics.
+    """
+
+    cases = load_cases()
+
+    stats = {
+        "total": len(cases),
+        "critical": 0,
+        "high": 0,
+        "medium": 0,
+        "low": 0,
+        "reported": 0,
+    }
+
+    for case in cases:
+
+        level = str(
+            case.get("risk", {}).get("level", "")
+        ).lower()
+
+        if level == "critical":
+            stats["critical"] += 1
+
+        elif level == "high":
+            stats["high"] += 1
+
+        elif level == "medium":
+            stats["medium"] += 1
+
+        elif level == "low":
+            stats["low"] += 1
+
+        if case.get("reported") is True:
+            stats["reported"] += 1
+
+    return stats
+
+
+# ============================================================
+# GET ALL CASES
+# ============================================================
+
+@app.get("/api/cases")
+def get_cases(
+    risk: str | None = None,
+    search: str | None = None,
+):
+    """
+    Return KhmerShield security cases.
+
+    Optional filters:
+
+    /api/cases
+
+    /api/cases?risk=HIGH
+
+    /api/cases?search=filename
+
+    /api/cases?search=sha256
+
+    /api/cases?risk=HIGH&search=exe
+    """
+
+    cases = load_cases()
+
+    # --------------------------------------------------------
+    # FILTER BY RISK
+    # --------------------------------------------------------
+
+    if risk:
+
+        risk = risk.upper()
+
+        cases = [
+            case
+            for case in cases
+            if str(
+                case.get("risk", {}).get("level", "")
+            ).upper() == risk
+        ]
+
+    # --------------------------------------------------------
+    # SEARCH
+    # --------------------------------------------------------
+
+    if search:
+
+        search = search.lower()
+
+        filtered_cases = []
+
+        for case in cases:
+
+            filename = str(
+                case.get("file", {}).get("filename", "")
+            ).lower()
+
+            case_id = str(
+                case.get("case_id", "")
+            ).lower()
+
+            sha256 = str(
+                case.get("file", {}).get("sha256", "")
+            ).lower()
+
+            if (
+                search in filename
+                or search in case_id
+                or search in sha256
+            ):
+                filtered_cases.append(case)
+
+        cases = filtered_cases
+
+    # --------------------------------------------------------
+    # NEWEST FIRST
+    # --------------------------------------------------------
+
+    cases.reverse()
+
+    return {
+        "total": len(cases),
+        "cases": cases,
+    }
+
+
+# ============================================================
+# GET SINGLE CASE
+#
+# IMPORTANT:
+# This dynamic route comes AFTER /api/cases/stats
+# ============================================================
+
+@app.get("/api/cases/{case_id}")
+def get_case(case_id: str):
+    """
+    Return one KhmerShield case.
+    """
+
+    cases = load_cases()
+
+    for case in cases:
+
+        if case.get("case_id") == case_id:
+            return case
+
+    raise HTTPException(
+        status_code=404,
+        detail="Case not found",
+    )
+
+
+# ============================================================
+# FILE SCANNING
+# ============================================================
+
+@app.post("/api/scan")
+async def scan_file(
+    file: UploadFile = File(...)
+):
+
+    # --------------------------------------------------------
+    # FILE NAME
+    # --------------------------------------------------------
+
+    filename = file.filename or "unknown"
+
+    extension = Path(filename).suffix.lower()
+
+    # --------------------------------------------------------
+    # EXTENSION CHECK
+    # --------------------------------------------------------
+
+    if extension not in ALLOWED_EXTENSIONS:
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {extension}"
+        )
+
+    # --------------------------------------------------------
+    # READ UPLOADED FILE
+    # --------------------------------------------------------
+
+    content = await file.read()
+
+    # --------------------------------------------------------
+    # FILE SIZE CHECK
+    # --------------------------------------------------------
+
+    if len(content) > MAX_FILE_SIZE:
+
+        raise HTTPException(
+            status_code=413,
+            detail="File exceeds 50 MB limit."
+        )
+
+    temp_path = None
+
+    try:
+
+        # ====================================================
+        # SAVE FILE TEMPORARILY
+        # ====================================================
+
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=extension
+        ) as temp_file:
+
+            temp_file.write(content)
+
+            temp_path = temp_file.name
+
+        # ====================================================
+        # BASIC FILE INFORMATION
+        # ====================================================
+
+        file_info = get_file_info(temp_path)
+
+        # Restore original uploaded filename
+        file_info["filename"] = filename
+
+        # ====================================================
+        # SHA-256
+        # ====================================================
+
+        sha256 = calculate_sha256(temp_path)
+
+        # ====================================================
+        # THREAT INTELLIGENCE INDICATORS
+        # ====================================================
+
+        try:
+
+            raw_text = Path(temp_path).read_text(
+                encoding="utf-8",
+                errors="ignore"
+            )
+
+            indicators = extract_indicators(raw_text)
+
+        except Exception:
+
+            indicators = {
+                "urls": [],
+                "domains": [],
+                "ips": [],
+            }
+
+        # ====================================================
+        # FILENAME ANALYSIS
+        # ====================================================
+
+        findings = analyze_filename(filename)
+
+        # ====================================================
+        # YARA SCAN
+        # ====================================================
+
+        yara_findings = scan_with_yara(temp_path)
+
+        findings.extend(yara_findings)
+
+        # ====================================================
+        # CLAMAV SCAN
+        # ====================================================
+
+        clamav_findings = scan_with_clamav(temp_path)
+
+        findings.extend(clamav_findings)
+
+        # ====================================================
+        # ARCHIVE ANALYSIS
+        # ====================================================
+
+        archive_result = None
+
+        archive_content_result = None
+
+        if extension == ".zip":
+
+            # ------------------------------------------------
+            # ZIP STRUCTURE ANALYSIS
+            # ------------------------------------------------
+
+            archive_result = analyze_zip(temp_path)
+
+            findings.extend(
+                archive_result.get(
+                    "findings",
+                    []
+                )
+            )
+
+            # ------------------------------------------------
+            # ZIP CONTENT ANALYSIS
+            # ------------------------------------------------
+
+            archive_content_result = analyze_zip_content(
+                temp_path
+            )
+
+            archive_indicators = (
+                archive_content_result.get(
+                    "indicators",
+                    {}
+                )
+            )
+
+            # ------------------------------------------------
+            # MERGE URLS
+            # ------------------------------------------------
+
+            indicators["urls"] = sorted(
+                set(indicators.get("urls", []))
+                |
+                set(
+                    archive_indicators.get(
+                        "urls",
+                        []
+                    )
+                )
+            )
+
+            # ------------------------------------------------
+            # MERGE DOMAINS
+            # ------------------------------------------------
+
+            indicators["domains"] = sorted(
+                set(indicators.get("domains", []))
+                |
+                set(
+                    archive_indicators.get(
+                        "domains",
+                        []
+                    )
+                )
+            )
+
+            # ------------------------------------------------
+            # MERGE IP ADDRESSES
+            # ------------------------------------------------
+
+            indicators["ips"] = sorted(
+                set(indicators.get("ips", []))
+                |
+                set(
+                    archive_indicators.get(
+                        "ips",
+                        []
+                    )
+                )
+            )
+
+        # ====================================================
+        # IP THREAT INTELLIGENCE
+        # ====================================================
+
+        ip_intelligence = []
+
+        for ip in indicators.get(
+            "ips",
+            []
+        ):
+
+            ip_intelligence.append(
+                lookup_ip(ip)
+            )
+
+        # ====================================================
+        # FINAL RISK CALCULATION
+        # ====================================================
+
+        risk = calculate_risk(findings)
+
+        # ====================================================
+        # FINAL RESPONSE
+        # ====================================================
+
+        return {
+            "status": "completed",
+
+            "filename": filename,
+
+            "file_info": file_info,
+
+            "sha256": sha256,
+
+            "risk": risk,
+
+            "findings": findings,
+
+            "indicators": indicators,
+
+            "ip_intelligence": ip_intelligence,
+
+            "archive": archive_result,
+
+            "archive_content": archive_content_result,
+        }
+
+    finally:
+
+        # ====================================================
+        # DELETE TEMPORARY FILE
+        # ====================================================
+
+        if temp_path:
+
+            try:
+
+                Path(temp_path).unlink(
+                    missing_ok=True
+                )
+
+            except Exception:
+                pass

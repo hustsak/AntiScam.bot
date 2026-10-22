@@ -1,0 +1,10 @@
+URGENT PAYMENT REQUIRED
+
+Your account has been suspended.
+
+Please verify your account immediately:
+http://secure-account-verification.example.com/login
+
+Send your OTP and password to complete verification.
+
+Payment required immediately.

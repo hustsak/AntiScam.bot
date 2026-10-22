@@ -1,0 +1,7 @@
+﻿KhmerShield AI Threat Intelligence Test
+
+Public IP:
+8.8.8.8
+
+Documentation IP:
+192.0.2.10

@@ -1,0 +1,12 @@
+KhmerShield Threat Intelligence Test
+
+Visit https://example.com/login
+
+Test domain:
+security-test.example
+
+Test IP:
+192.0.2.10
+
+Another URL:
+http://example.org/download/file.zip

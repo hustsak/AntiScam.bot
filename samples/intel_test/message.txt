@@ -1,0 +1,12 @@
+KhmerShield AI Test
+
+This is a harmless test file.
+
+URL:
+https://example.com/login
+
+IP:
+192.0.2.10
+
+Domain:
+security-test.example

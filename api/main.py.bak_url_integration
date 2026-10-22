@@ -1,0 +1,708 @@
+﻿from pathlib import Path
+import json
+import tempfile
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+
+from api.case_store import create_case
+
+from intelligence.ip_lookup import lookup_ip
+from intelligence.extract import extract_indicators
+
+from analyzer.archive_content import analyze_zip_content
+from analyzer.clamav_scan import scan_with_clamav
+from analyzer.yara_scan import scan_with_yara
+from analyzer.hash import calculate_sha256
+from analyzer.file_info import get_file_info
+from analyzer.indicators import analyze_filename
+from analyzer.risk import calculate_risk
+from analyzer.archive import analyze_zip
+
+from ml.predict import predict_file
+
+
+# ============================================================
+# APPLICATION
+# ============================================================
+
+app = FastAPI(
+    title="KhmerShield AI",
+    description="Telegram Scam & Suspicious File Detector",
+    version="0.1.0"
+)
+
+
+# ============================================================
+# CORS
+# ============================================================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+ALLOWED_EXTENSIONS = {
+    ".zip",
+    ".rar",
+    ".7z",
+    ".pdf",
+    ".exe",
+    ".apk",
+    ".txt",
+}
+
+MAX_FILE_SIZE = 50 * 1024 * 1024
+
+
+# ============================================================
+# PROJECT PATHS
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+REPORTS_DIR = PROJECT_ROOT / "reports"
+CASES_FILE = REPORTS_DIR / "telegram_cases.jsonl"
+
+REPORTS_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ============================================================
+# CASE LOADER
+# ============================================================
+
+def load_cases():
+    """
+    Load saved Telegram scan cases.
+    """
+
+    if not CASES_FILE.exists():
+        return []
+
+    cases = []
+
+    try:
+        with open(
+            CASES_FILE,
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            for line in file:
+
+                line = line.strip()
+
+                if not line:
+                    continue
+
+                try:
+                    cases.append(
+                        json.loads(line)
+                    )
+                except json.JSONDecodeError:
+                    continue
+
+    except Exception:
+        return []
+
+    return cases
+
+
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get("/")
+def root():
+
+    return {
+        "name": "KhmerShield AI",
+        "description": "Telegram Scam & Suspicious File Detector",
+        "version": "0.1.0",
+        "status": "online",
+    }
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/health")
+def health():
+
+    model_path = PROJECT_ROOT / "ml" / "model.joblib"
+
+    return {
+        "status": "healthy",
+        "models_loaded": model_path.exists(),
+        "ml_model": (
+            "RandomForestClassifier"
+            if model_path.exists()
+            else None
+        ),
+    }
+
+
+# ============================================================
+# CASE STATISTICS
+# ============================================================
+
+@app.get("/api/cases/stats")
+def case_stats():
+
+    cases = load_cases()
+
+    total = len(cases)
+
+    risk_counts = {
+        "safe": 0,
+        "low": 0,
+        "medium": 0,
+        "high": 0,
+        "critical": 0,
+        "unknown": 0,
+    }
+
+    reported = 0
+
+    for case in cases:
+
+        risk_data = case.get(
+            "risk",
+            {}
+        )
+
+        if isinstance(
+            risk_data,
+            dict
+        ):
+
+            level = str(
+                risk_data.get(
+                    "level",
+                    "unknown"
+                )
+            ).lower()
+
+        else:
+
+            level = "unknown"
+
+        if level in risk_counts:
+            risk_counts[level] += 1
+        else:
+            risk_counts["unknown"] += 1
+
+        if case.get("reported") is True:
+            reported += 1
+
+    return {
+        "total_cases": total,
+        "risk_counts": risk_counts,
+        "reported_cases": reported,
+    }
+
+
+# ============================================================
+# CASE LIST
+# ============================================================
+
+@app.get("/api/cases")
+def get_cases(
+    risk: str | None = None,
+    search: str | None = None,
+):
+
+    cases = load_cases()
+
+    # Newest first
+    cases.reverse()
+
+    # Risk filter
+    if risk:
+
+        risk = risk.lower()
+
+        filtered = []
+
+        for case in cases:
+
+            risk_data = case.get(
+                "risk",
+                {}
+            )
+
+            if isinstance(
+                risk_data,
+                dict
+            ):
+
+                level = str(
+                    risk_data.get(
+                        "level",
+                        ""
+                    )
+                ).lower()
+
+            else:
+
+                level = ""
+
+            if level == risk:
+                filtered.append(case)
+
+        cases = filtered
+
+    # Search filter
+    if search:
+
+        search = search.lower()
+
+        filtered = []
+
+        for case in cases:
+
+            filename = str(
+                case.get(
+                    "filename",
+                    ""
+                )
+            ).lower()
+
+            case_id = str(
+                case.get(
+                    "case_id",
+                    ""
+                )
+            ).lower()
+
+            sha256 = str(
+                case.get(
+                    "sha256",
+                    ""
+                )
+            ).lower()
+
+            if (
+                search in filename
+                or search in case_id
+                or search in sha256
+            ):
+                filtered.append(case)
+
+        cases = filtered
+
+    return {
+        "total": len(cases),
+        "cases": cases,
+    }
+
+
+# ============================================================
+# SINGLE CASE
+# ============================================================
+
+@app.get("/api/cases/{case_id}")
+def get_case(case_id: str):
+
+    cases = load_cases()
+
+    for case in cases:
+
+        if case.get("case_id") == case_id:
+            return case
+
+    raise HTTPException(
+        status_code=404,
+        detail="Case not found"
+    )
+
+
+# ============================================================
+# FILE SCAN
+# ============================================================
+
+@app.post("/api/scan")
+async def scan_file(
+    file: UploadFile = File(...)
+):
+
+    filename = file.filename or "unknown_file"
+
+    extension = Path(
+        filename
+    ).suffix.lower()
+
+    # --------------------------------------------------------
+    # CHECK EXTENSION
+    # --------------------------------------------------------
+
+    if extension not in ALLOWED_EXTENSIONS:
+
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "Unsupported file type",
+                "filename": filename,
+                "extension": extension,
+                "allowed_extensions": sorted(
+                    ALLOWED_EXTENSIONS
+                ),
+            }
+        )
+
+    # --------------------------------------------------------
+    # READ FILE
+    # --------------------------------------------------------
+
+    file_data = await file.read()
+
+    file_size = len(file_data)
+
+    # --------------------------------------------------------
+    # CHECK SIZE
+    # --------------------------------------------------------
+
+    if file_size > MAX_FILE_SIZE:
+
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "error": "File too large",
+                "max_size_mb": MAX_FILE_SIZE / 1024 / 1024,
+            }
+        )
+
+    temp_path = None
+
+    try:
+
+        # ----------------------------------------------------
+        # SAVE TEMPORARY FILE
+        # ----------------------------------------------------
+
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            suffix=extension
+        ) as temp_file:
+
+            temp_file.write(file_data)
+
+            temp_path = Path(
+                temp_file.name
+            )
+
+        # ----------------------------------------------------
+        # FILE INFORMATION
+        # ----------------------------------------------------
+
+        file_info = get_file_info(
+            temp_path
+        )
+
+        # Preserve original filename
+        if isinstance(
+            file_info,
+            dict
+        ):
+            file_info["filename"] = filename
+
+        # ----------------------------------------------------
+        # SHA256
+        # ----------------------------------------------------
+
+        sha256 = calculate_sha256(
+            temp_path
+        )
+
+        # ----------------------------------------------------
+        # TEXT / INDICATOR EXTRACTION
+        # ----------------------------------------------------
+
+        try:
+
+            text_content = file_data.decode(
+                "utf-8",
+                errors="ignore"
+            )
+
+        except Exception:
+
+            text_content = ""
+
+        indicators = extract_indicators(
+            text_content
+        )
+
+        # ----------------------------------------------------
+        # FILENAME ANALYSIS
+        # ----------------------------------------------------
+
+        filename_findings = analyze_filename(
+            filename
+        )
+
+        # ----------------------------------------------------
+        # YARA
+        # ----------------------------------------------------
+
+        yara_result = scan_with_yara(
+            temp_path
+        )
+
+        # ----------------------------------------------------
+        # CLAMAV
+        # ----------------------------------------------------
+
+        clamav_result = scan_with_clamav(
+            temp_path
+        )
+
+        # ----------------------------------------------------
+        # FINDINGS
+        # ----------------------------------------------------
+
+        findings = {
+            "filename": filename_findings,
+            "yara": yara_result,
+            "clamav": clamav_result,
+        }
+
+        # ----------------------------------------------------
+        # ARCHIVE ANALYSIS
+        # ----------------------------------------------------
+
+        archive_result = None
+        archive_content_result = None
+
+        if extension == ".zip":
+
+            try:
+
+                archive_result = analyze_zip(
+                    temp_path
+                )
+
+            except Exception as e:
+
+                archive_result = {
+                    "error": str(e)
+                }
+
+            try:
+
+                archive_content_result = (
+                    analyze_zip_content(
+                        temp_path
+                    )
+                )
+
+            except Exception as e:
+
+                archive_content_result = {
+                    "error": str(e)
+                }
+
+        # ----------------------------------------------------
+        # IP INTELLIGENCE
+        # ----------------------------------------------------
+
+        ip_intelligence = {}
+
+        ips = []
+
+        if isinstance(
+            indicators,
+            dict
+        ):
+
+            ips = indicators.get(
+                "ips",
+                []
+            )
+
+        for ip in ips:
+
+            try:
+
+                ip_intelligence[ip] = lookup_ip(
+                    ip
+                )
+
+            except Exception as e:
+
+                ip_intelligence[ip] = {
+                    "error": str(e)
+                }
+
+        # ----------------------------------------------------
+        # MERGE ARCHIVE INDICATORS
+        # ----------------------------------------------------
+
+        if isinstance(
+            archive_result,
+            dict
+        ):
+
+            archive_ips = archive_result.get(
+                "ips",
+                []
+            )
+
+            for ip in archive_ips:
+
+                if ip not in ips:
+
+                    ips.append(ip)
+
+                    try:
+
+                        ip_intelligence[ip] = lookup_ip(
+                            ip
+                        )
+
+                    except Exception as e:
+
+                        ip_intelligence[ip] = {
+                            "error": str(e)
+                        }
+
+        if isinstance(
+            archive_content_result,
+            dict
+        ):
+
+            archive_content_ips = (
+                archive_content_result.get(
+                    "ips",
+                    []
+                )
+            )
+
+            for ip in archive_content_ips:
+
+                if ip not in ips:
+
+                    ips.append(ip)
+
+                    try:
+
+                        ip_intelligence[ip] = lookup_ip(
+                            ip
+                        )
+
+                    except Exception as e:
+
+                        ip_intelligence[ip] = {
+                            "error": str(e)
+                        }
+
+        # ----------------------------------------------------
+        # RULE-BASED RISK
+        # ----------------------------------------------------
+
+        risk = calculate_risk(
+            findings
+        )
+
+        # ----------------------------------------------------
+        # ML PREDICTION
+        # ----------------------------------------------------
+
+        try:
+
+            ml_result = predict_file(
+                str(temp_path)
+            )
+
+        except Exception as e:
+
+            ml_result = {
+                "prediction": None,
+                "verdict": "UNAVAILABLE",
+                "suspicious_probability": None,
+                "error": str(e),
+            }
+
+        # ----------------------------------------------------
+        # BUILD RESPONSE
+        # ----------------------------------------------------
+
+        result = {
+            "status": "completed",
+
+            "filename": filename,
+
+            "file_info": file_info,
+
+            "sha256": sha256,
+
+            "risk": risk,
+
+            "ml": ml_result,
+
+            "findings": findings,
+
+            "indicators": indicators,
+
+            "ip_intelligence": ip_intelligence,
+
+            "archive": archive_result,
+
+            "archive_content": archive_content_result,
+        }
+
+        # ----------------------------------------------------
+        # SAVE CASE
+        # ----------------------------------------------------
+
+        try:
+
+            case = create_case(
+                filename=filename,
+                sha256=sha256,
+                risk=risk,
+                findings=findings,
+                indicators=indicators,
+                result=result,
+            )
+
+            if case is not None:
+
+                result["case"] = case
+
+        except Exception as e:
+
+            result["case_storage_error"] = str(e)
+
+        return result
+
+    finally:
+
+        # ----------------------------------------------------
+        # DELETE TEMP FILE
+        # ----------------------------------------------------
+
+        if temp_path:
+
+            try:
+
+                if temp_path.exists():
+                    temp_path.unlink()
+
+            except Exception:
+                pass
